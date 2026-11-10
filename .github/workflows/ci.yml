@@ -1,0 +1,290 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * 1" # weekly rebuild so base-image fixes are picked up, re-scanned and re-signed
+  workflow_dispatch:
+
+# Least privilege: nothing by default, each job asks for what it needs.
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
+  SIGNER_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/ci.yml@refs/heads/main
+
+jobs:
+  test:
+    name: Test and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: app/pom.xml
+
+      - name: Unit tests
+        working-directory: app
+        run: mvn -B verify
+
+      - uses: azure/setup-helm@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lint chart
+        run: helm lint charts/helmsman
+
+      - name: Scan chart manifests
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: config
+          scan-ref: charts/helmsman
+          trivyignores: .trivyignore.config
+          exit-code: "1"
+
+  build:
+    name: Build, scan, sign
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write # push image
+      id-token: write # keyless signing (OIDC)
+      attestations: write # SLSA provenance
+      security-events: write # upload SARIF
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha,format=short,prefix=sha-
+
+      - name: Build (push on main only)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          pull: true
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
+            GIT_COMMIT=${{ github.sha }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resolve image reference
+        id: ref
+        env:
+          EVENT: ${{ github.event_name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "value=${IMAGE}:${VERSION}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${IMAGE}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trivy scan (SARIF for the Security tab)
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          image-ref: ${{ steps.ref.outputs.value }}
+          format: sarif
+          output: trivy.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          limit-severities-for-sarif: true
+          exit-code: "0"
+
+      - name: Upload SARIF
+        if: always() && github.event.pull_request.head.repo.fork != true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-image
+
+      - name: Trivy gate (fail on fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          image-ref: ${{ steps.ref.outputs.value }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # ---- Everything below runs only on main, after the gate has passed ----
+
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v4
+
+      - name: Sign image (keyless, by digest)
+        if: github.event_name != 'pull_request'
+        env:
+          REF: ${{ steps.ref.outputs.value }}
+        run: cosign sign --yes "$REF"
+
+      - name: Generate SBOM (Syft, SPDX)
+        if: github.event_name != 'pull_request'
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.ref.outputs.value }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          artifact-name: sbom.spdx.json
+          upload-artifact: true
+          upload-release-assets: false
+
+      - name: Attach SBOM as signed attestation
+        if: github.event_name != 'pull_request'
+        env:
+          REF: ${{ steps.ref.outputs.value }}
+        run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$REF"
+
+      - name: SLSA build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  deploy:
+    name: Verify and deploy to kind
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    env:
+      DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: sigstore/cosign-installer@v4
+
+      - name: Verify signature and SBOM attestation
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "${GITHUB_TOKEN}" | cosign login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          REF="${IMAGE}@${DIGEST}"
+          cosign verify "$REF" \
+            --certificate-identity "$SIGNER_IDENTITY" \
+            --certificate-oidc-issuer "$OIDC_ISSUER" > /dev/null
+          echo "signature OK"
+          cosign verify-attestation "$REF" --type spdxjson \
+            --certificate-identity "$SIGNER_IDENTITY" \
+            --certificate-oidc-issuer "$OIDC_ISSUER" > /dev/null
+          echo "SBOM attestation OK"
+
+      - name: Verify SLSA provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "${{ github.repository }}"
+
+      - name: Negative control (an image we did not sign must be rejected)
+        run: |
+          if cosign verify gcr.io/distroless/static:nonroot \
+              --certificate-identity "$SIGNER_IDENTITY" \
+              --certificate-oidc-issuer "$OIDC_ISSUER" > /dev/null 2>&1; then
+            echo "verification accepted a foreign image, the gate is broken" >&2
+            exit 1
+          fi
+          echo "foreign image correctly rejected"
+
+      - uses: azure/setup-helm@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: helmsman
+          config: deploy/kind-config.yaml
+
+      - name: Deploy with Helm
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          kubectl apply -f deploy/namespace.yaml
+          kubectl -n helmsman create secret docker-registry ghcr-pull \
+            --docker-server=ghcr.io \
+            --docker-username="${GITHUB_ACTOR}" \
+            --docker-password="${GITHUB_TOKEN}"
+          helm upgrade --install helmsman charts/helmsman \
+            --namespace helmsman \
+            --set image.repository="${IMAGE}" \
+            --set image.digest="${DIGEST}" \
+            --set "imagePullSecrets[0].name=ghcr-pull" \
+            --atomic --wait --timeout 180s
+
+      - name: Smoke test
+        env:
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: ./scripts/smoke-test.sh
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n helmsman get all,events || true
+          kubectl -n helmsman describe pods || true
+          kubectl -n helmsman logs -l app.kubernetes.io/name=helmsman --tail=100 || true
+
+      - name: Summary
+        if: success()
+        run: |
+          {
+            echo "### Deployed and verified"
+            echo ""
+            echo "- Image: \`${IMAGE}@${DIGEST}\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Signature, SBOM attestation and SLSA provenance verified before deploy"
+            echo "- Smoke test passed on kind"
+          } >> "$GITHUB_STEP_SUMMARY"

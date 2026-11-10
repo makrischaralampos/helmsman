@@ -25,3 +25,5 @@ podDisruptionBudget:
 
 networkPolicy:
   enabled: true
+
+imagePullSecrets: []
