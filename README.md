@@ -31,21 +31,22 @@ flowchart LR
   E --> F[Syft SBOM as<br/>signed attestation]
   F --> G[SLSA provenance]
   G --> H[Verify signature, SBOM,<br/>provenance]
-  H --> I[Helm deploy to kind]
+  H --> K[Kyverno admission policy:<br/>only signed images run]
+  K --> I[Helm deploy to kind]
   I --> J[Smoke test:<br/>running commit == built commit]
 ```
 
-| Stage      | What happens                                                                     | Tooling                     |
-| ---------- | -------------------------------------------------------------------------------- | --------------------------- |
-| Test       | Unit tests, Helm lint, manifest misconfiguration scan                            | Maven, JUnit 5, Helm, Trivy |
-| Build      | Multi-stage build, fresh base pull, digest-pinned base images                    | Docker BuildKit             |
-| Scan       | Fails on fixable HIGH/CRITICAL; SARIF uploaded to the Security tab               | Trivy                       |
-| Sign       | Keyless signature by digest, identity bound to this workflow on `main`           | Cosign, Sigstore            |
-| SBOM       | SPDX SBOM generated and attached as a signed attestation                         | Syft, Cosign                |
-| Provenance | SLSA build provenance, stored alongside the image                                | GitHub attestations         |
-| Verify     | Signature, SBOM and provenance re-checked before deploy, plus a negative control | Cosign, `gh attestation`    |
-| Deploy     | Helm into a restricted Pod Security namespace, deployed by immutable digest      | Helm, kind                  |
-| Smoke test | Health, version/commit match, 404 behaviour, replica readiness                   | `scripts/smoke-test.sh`     |
+| Stage      | What happens                                                                                                                       | Tooling                     |
+| ---------- | ---------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
+| Test       | Unit tests, Helm lint, manifest misconfiguration scan                                                                              | Maven, JUnit 5, Helm, Trivy |
+| Build      | Multi-stage build, fresh base pull, digest-pinned base images                                                                      | Docker BuildKit             |
+| Scan       | Fails on fixable HIGH/CRITICAL; SARIF uploaded to the Security tab                                                                 | Trivy                       |
+| Sign       | Keyless signature by digest, identity bound to this workflow on `main`                                                             | Cosign, Sigstore            |
+| SBOM       | SPDX SBOM generated and attached as a signed attestation                                                                           | Syft, Cosign                |
+| Provenance | SLSA build provenance, stored alongside the image                                                                                  | GitHub attestations         |
+| Verify     | Signature, SBOM and provenance re-checked before deploy, plus a negative control                                                   | Cosign, `gh attestation`    |
+| Deploy     | Kyverno admits only images signed by this workflow, then Helm deploys by immutable digest into a restricted Pod Security namespace | Kyverno, Helm, kind         |
+| Smoke test | Health, version/commit match, 404 behaviour, replica readiness                                                                     | `scripts/smoke-test.sh`     |
 
 Pull requests run everything up to the scan gate and publish nothing. Only `main` pushes
 (and the weekly rebuild) publish, sign and deploy.
@@ -75,6 +76,9 @@ Pull requests run everything up to the scan gate and publish nothing. Only `main
 - Namespace enforces the `restricted` Pod Security Standard. The cluster rejects insecure pods.
 - PodDisruptionBudget, resource requests and limits, rolling updates with zero unavailable.
 - NetworkPolicy: ingress on the app port only, no egress.
+- Admission control: a Kyverno `ImageValidatingPolicy` rejects any pod in the namespace whose image
+  is not signed by `ci.yml` on `main`, enforced by the cluster itself. The pipeline asserts this on
+  every run by trying to start an unsigned image and requiring the rejection.
 
 **Workflow hygiene**
 
@@ -149,8 +153,9 @@ scripts/                 smoke test, consumer-side image verification
 
 - Deploys target an ephemeral kind cluster in CI, which demonstrates the mechanism rather than
   a long-lived environment.
-- Signatures are verified in the pipeline, not at cluster admission. Next step: enforce at
-  admission with a Kubernetes policy engine so the cluster itself rejects unsigned images.
+- Admission policy is enforced in an ephemeral cluster and scoped to one namespace; a real
+  environment would apply it cluster-wide with an exception list for system namespaces.
+- The Kyverno chart is pinned by version but not by digest.
 - Single architecture (linux/amd64).
 - OpenSSF Scorecard and SLSA level assessment are not yet published.
 

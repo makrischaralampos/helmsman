@@ -22,3 +22,4 @@ You can expect an acknowledgement within 7 days.
 - A signed SPDX SBOM (Syft) and SLSA build provenance are attached to every image.
 - The deploy job re-verifies signature, SBOM attestation and provenance before deploying.
 - All GitHub Actions are pinned to commit SHAs and updated through Dependabot.
+- The cluster enforces signatures at admission: pods whose images were not signed by this workflow are rejected.

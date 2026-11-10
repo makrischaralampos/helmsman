@@ -7,7 +7,9 @@ RELEASE   := helmsman
 COMMIT    := $(shell git rev-parse --short HEAD)
 IMAGE     := helmsman:$(COMMIT)
 
-.PHONY: help test lint image scan cluster load deploy smoke up clean
+.PHONY: help test lint image scan cluster load deploy smoke up clean kyverno policy test-unsigned
+
+KYVERNO_CHART ?= 3.9.2
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-10s %s\n", $$1, $$2}'
@@ -44,6 +46,25 @@ smoke: ## Run the smoke test against the deployment
 	EXPECTED_COMMIT=$(COMMIT) NAMESPACE=$(NAMESPACE) RELEASE=$(RELEASE) ./scripts/smoke-test.sh
 
 up: test lint image scan cluster load deploy smoke ## Run the whole pipeline locally
+
+kyverno: ## Install Kyverno into the kind cluster
+	helm repo add kyverno https://kyverno.github.io/kyverno/ >/dev/null
+	helm repo update >/dev/null
+	helm upgrade --install kyverno kyverno/kyverno \
+		--namespace kyverno --create-namespace \
+		--version $(KYVERNO_CHART) \
+		--set admissionController.replicas=1 \
+		--set backgroundController.enabled=false \
+		--set cleanupController.enabled=false \
+		--set reportsController.enabled=false \
+		--wait --timeout 300s
+
+policy: ## Enforce signed images in the helmsman namespace
+	kubectl apply -f deploy/namespace.yaml
+	kubectl apply -f policy/verify-signed-images.yaml
+
+test-unsigned: ## Prove an unsigned image is rejected at admission
+	@! kubectl apply -f policy/tests/unsigned-pod.yaml
 
 clean: ## Delete the kind cluster
 	kind delete cluster --name $(CLUSTER)

@@ -20,6 +20,7 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
   OIDC_ISSUER: https://token.actions.githubusercontent.com
   SIGNER_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/ci.yml@refs/heads/main
+  KYVERNO_CHART_VERSION: "3.9.2"
 
 jobs:
   test:
@@ -250,11 +251,47 @@ jobs:
           cluster_name: helmsman
           config: deploy/kind-config.yaml
 
-      - name: Deploy with Helm
+      - name: Install Kyverno
+        run: |
+          helm repo add kyverno https://kyverno.github.io/kyverno/
+          helm repo update
+          helm install kyverno kyverno/kyverno \
+            --namespace kyverno --create-namespace \
+            --version "$KYVERNO_CHART_VERSION" \
+            --set admissionController.replicas=1 \
+            --set backgroundController.enabled=false \
+            --set cleanupController.enabled=false \
+            --set reportsController.enabled=false \
+            --wait --timeout 300s
+
+      - name: Enforce signed images at admission
+        run: |
+          kubectl apply -f deploy/namespace.yaml
+          kubectl apply -f policy/verify-signed-images.yaml
+
+      - name: Assert admission rejects an unsigned image
+        run: |
+          # Retries double as a wait for the policy to become active.
+          for i in $(seq 1 30); do
+            if OUT=$(kubectl apply -f policy/tests/unsigned-pod.yaml 2>&1); then
+              echo "policy not active yet, retrying"
+              kubectl -n helmsman delete pod unsigned-probe --ignore-not-found
+              sleep 2
+            elif echo "$OUT" | grep -qF "must be signed by the Helmsman CI workflow"; then
+              echo "unsigned image rejected by the admission policy"
+              exit 0
+            else
+              echo "$OUT"
+              sleep 2
+            fi
+          done
+          echo "admission policy never rejected the unsigned image" >&2
+          exit 1
+
+      - name: Deploy with Helm (signed image, admitted by policy)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          kubectl apply -f deploy/namespace.yaml
           kubectl -n helmsman create secret docker-registry ghcr-pull \
             --docker-server=ghcr.io \
             --docker-username="${GITHUB_ACTOR}" \
@@ -277,6 +314,7 @@ jobs:
           kubectl -n helmsman get all,events || true
           kubectl -n helmsman describe pods || true
           kubectl -n helmsman logs -l app.kubernetes.io/name=helmsman --tail=100 || true
+          kubectl -n kyverno logs deploy/kyverno-admission-controller --tail=100 || true
 
       - name: Summary
         if: success()
@@ -287,5 +325,6 @@ jobs:
             echo "- Image: \`${IMAGE}@${DIGEST}\`"
             echo "- Commit: \`${GITHUB_SHA}\`"
             echo "- Signature, SBOM attestation and SLSA provenance verified before deploy"
+            echo "- Cluster admission policy rejected an unsigned image, then admitted the signed one"
             echo "- Smoke test passed on kind"
           } >> "$GITHUB_STEP_SUMMARY"
