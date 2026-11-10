@@ -7,7 +7,7 @@ RUN --mount=type=cache,target=/root/.m2 mvn -B -q dependency:resolve
 COPY src ./src
 RUN --mount=type=cache,target=/root/.m2 mvn -B -q -DskipTests package
 
-FROM gcr.io/distroless/java21-debian12:nonroot
+FROM gcr.io/distroless/java21-debian13:nonroot
 ARG APP_VERSION=dev
 ARG GIT_COMMIT=unknown
 ENV APP_VERSION=${APP_VERSION} \

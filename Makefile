@@ -20,7 +20,7 @@ lint: ## Lint the chart and scan its manifests
 	trivy config --ignorefile .trivyignore.config --exit-code 1 charts/helmsman
 
 image: ## Build the container image tagged with the git commit
-	docker build -t $(IMAGE) --build-arg APP_VERSION=local --build-arg GIT_COMMIT=$(COMMIT) app
+	docker build --pull -t $(IMAGE) --build-arg APP_VERSION=local --build-arg GIT_COMMIT=$(COMMIT) app
 
 scan: ## Fail on fixable HIGH/CRITICAL vulnerabilities in the image
 	trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 $(IMAGE)
