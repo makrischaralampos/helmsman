@@ -23,3 +23,7 @@
 ## Cluster rejects an insecure pod
 
 ![pod security rejection](img/psa-reject.png)
+
+## Cluster rejects an unsigned image at admission
+
+![admission rejection](img/admission-reject.png)
